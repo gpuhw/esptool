@@ -259,7 +259,7 @@ class ESPLoader(object):
             raise FatalError("Failed to set baud rate %d. The driver may not support this rate." % baud)
 
     @staticmethod
-    def detect_chip(port=DEFAULT_PORT, baud=ESP_ROM_BAUD, connect_mode='default_reset', trace_enabled=False):
+    def detect_chip(port=DEFAULT_PORT, baud=ESP_ROM_BAUD, send_break=False, connect_mode='default_reset', trace_enabled=False):
         """ Use serial access to detect the chip type.
 
         We use the UART's datecode register for this, it's mapped at
@@ -271,7 +271,7 @@ class ESPLoader(object):
         connect_mode parameter) as part of querying the chip.
         """
         detect_port = ESPLoader(port, baud, trace_enabled=trace_enabled)
-        detect_port.connect(connect_mode)
+        detect_port.connect(connect_mode, send_break)
         try:
             print('Detecting chip type...', end='')
             sys.stdout.flush()
@@ -405,7 +405,7 @@ class ESPLoader(object):
         # request is sent with the updated RTS state and the same DTR state
         self._port.setDTR(self._port.dtr)
 
-    def _connect_attempt(self, mode='default_reset', esp32r0_delay=False):
+    def _connect_attempt(self, mode='default_reset', send_break=False, esp32r0_delay=False):
         """ A single connection attempt, with esp32r0 workaround options """
         # esp32r0_delay is a workaround for bugs with the most common auto reset
         # circuit and Windows, if the EN pin on the dev board does not have
@@ -430,23 +430,27 @@ class ESPLoader(object):
         # DTR & RTS are active low signals,
         # ie True = pin @ 0V, False = pin @ VCC.
         if mode != 'no_reset':
-            self._setDTR(False)  # IO0=HIGH
-            self._setRTS(True)   # EN=LOW, chip in reset
-            time.sleep(0.1)
-            if esp32r0_delay:
-                # Some chips are more likely to trigger the esp32r0
-                # watchdog reset silicon bug if they're held with EN=LOW
-                # for a longer period
-                time.sleep(1.2)
-            self._setDTR(True)   # IO0=LOW
-            self._setRTS(False)  # EN=HIGH, chip out of reset
-            if esp32r0_delay:
-                # Sleep longer after reset.
-                # This workaround only works on revision 0 ESP32 chips,
-                # it exploits a silicon bug spurious watchdog reset.
-                time.sleep(0.4)  # allow watchdog reset to occur
-            time.sleep(0.05)
-            self._setDTR(False)  # IO0=HIGH, done
+            if send_break:
+                self._port.send_break(0.2)
+                time.sleep(0.1)
+            else:
+                self._setDTR(False)  # IO0=HIGH
+                self._setRTS(True)   # EN=LOW, chip in reset
+                time.sleep(0.1)
+                if esp32r0_delay:
+                    # Some chips are more likely to trigger the esp32r0
+                    # watchdog reset silicon bug if they're held with EN=LOW
+                    # for a longer period
+                    time.sleep(1.2)
+                self._setDTR(True)   # IO0=LOW
+                self._setRTS(False)  # EN=HIGH, chip out of reset
+                if esp32r0_delay:
+                    # Sleep longer after reset.
+                    # This workaround only works on revision 0 ESP32 chips,
+                    # it exploits a silicon bug spurious watchdog reset.
+                    time.sleep(0.4)  # allow watchdog reset to occur
+                time.sleep(0.05)
+                self._setDTR(False)  # IO0=HIGH, done
 
         for _ in range(5):
             try:
@@ -464,7 +468,7 @@ class ESPLoader(object):
                 last_error = e
         return last_error
 
-    def connect(self, mode='default_reset'):
+    def connect(self, mode='default_reset', send_break=False):
         """ Try connecting repeatedly until successful, or giving up """
         print('Connecting...', end='')
         sys.stdout.flush()
@@ -472,10 +476,10 @@ class ESPLoader(object):
 
         try:
             for _ in range(7):
-                last_error = self._connect_attempt(mode=mode, esp32r0_delay=False)
+                last_error = self._connect_attempt(mode=mode, send_break=send_break, esp32r0_delay=False)
                 if last_error is None:
                     return
-                last_error = self._connect_attempt(mode=mode, esp32r0_delay=True)
+                last_error = self._connect_attempt(mode=mode, send_break=send_break, esp32r0_delay=True)
                 if last_error is None:
                     return
         finally:
@@ -956,10 +960,14 @@ class ESPLoader(object):
             print("WARNING: Detected crystal freq %.2fMHz is quite different to normalized freq %dMHz. Unsupported crystal in use?" % (est_xtal, norm_xtal))
         return norm_xtal
 
-    def hard_reset(self):
-        self._setRTS(True)  # EN->LOW
-        time.sleep(0.1)
-        self._setRTS(False)
+    def hard_reset(self, send_break):
+        if send_break:
+            self._port.send_break(0.2)
+            time.sleep(0.1)
+        else:
+            self._setRTS(True)  # EN->LOW
+            time.sleep(0.1)
+            self._setRTS(False)
 
     def soft_reset(self, stay_in_bootloader):
         if not self.IS_STUB:
@@ -2570,6 +2578,11 @@ def main(custom_commandline=None):
         default=os.environ.get('ESPTOOL_BAUD', ESPLoader.ESP_ROM_BAUD))
 
     parser.add_argument(
+        '--send-break',
+        action = 'store_true',
+        help='Send a BREAK over the serial port to reset the device.')
+
+    parser.add_argument(
         '--before',
         help='What to do before connecting to the chip',
         choices=['default_reset', 'no_reset', 'no_reset_no_sync'],
@@ -2807,7 +2820,7 @@ def main(custom_commandline=None):
             print("Serial port %s" % each_port)
             try:
                 if args.chip == 'auto':
-                    esp = ESPLoader.detect_chip(each_port, initial_baud, args.before, args.trace)
+                    esp = ESPLoader.detect_chip(each_port, initial_baud, args.send_break, args.before, args.trace)
                 else:
                     chip_class = {
                         'esp8266': ESP8266ROM,
@@ -2875,8 +2888,11 @@ def main(custom_commandline=None):
             # the ESP is now running the loaded image, so let it run
             print('Exiting immediately.')
         elif args.after == 'hard_reset':
-            print('Hard resetting via RTS pin...')
-            esp.hard_reset()
+            if args.send_break:
+                print('Hard resetting via BREAK...')
+            else:
+                print('Hard resetting via RTS pin...')
+            esp.hard_reset(args.send_break)
         elif args.after == 'soft_reset':
             print('Soft resetting...')
             # flash_finish will trigger a soft reset
